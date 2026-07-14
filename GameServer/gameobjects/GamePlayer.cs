@@ -174,6 +174,56 @@ namespace DOL.GS
             set { m_usedetailedcombatlog = value;}
         }
 
+        private bool m_godModePowerEnabled;
+        private bool m_attackablePowerEnabled;
+        private bool m_damageBoostPowerEnabled;
+        private double m_damageBoostPowerMultiplier = 10.0;
+        private double m_effectivenessBeforeDamageBoost = 1.0;
+
+        /// <summary>
+        /// Temporary GM powers. These are deliberately not persisted to the character database.
+        /// </summary>
+        public bool GodModePowerEnabled => m_godModePowerEnabled;
+        public bool AttackablePowerEnabled => m_attackablePowerEnabled;
+        public bool DamageBoostPowerEnabled => m_damageBoostPowerEnabled;
+        public double DamageBoostPowerMultiplier => m_damageBoostPowerMultiplier;
+
+        internal void SetGodModePower(bool enabled)
+        {
+            m_godModePowerEnabled = enabled;
+        }
+
+        internal void SetAttackablePower(bool enabled)
+        {
+            m_attackablePowerEnabled = enabled;
+        }
+
+        internal void EnableDamageBoostPower(double multiplier)
+        {
+            if (!m_damageBoostPowerEnabled)
+                m_effectivenessBeforeDamageBoost = Effectiveness;
+
+            m_damageBoostPowerEnabled = true;
+            m_damageBoostPowerMultiplier = multiplier;
+            Effectiveness = multiplier;
+        }
+
+        internal void DisableDamageBoostPower()
+        {
+            if (!m_damageBoostPowerEnabled)
+                return;
+
+            m_damageBoostPowerEnabled = false;
+            Effectiveness = m_effectivenessBeforeDamageBoost;
+        }
+
+        internal void DisableAllPowers()
+        {
+            SetGodModePower(false);
+            SetAttackablePower(false);
+            DisableDamageBoostPower();
+        }
+
         public eXPLogState XPLogState
         {
             get { return m_xplogstate; }
@@ -257,7 +307,14 @@ namespace DOL.GS
         /// <summary>
         /// Whether or not the player can be attacked.
         /// </summary>
-        public override bool IsAttackable { get { return (Client.Account.PrivLevel <= (uint)ePrivLevel.Player && base.IsAttackable); }}
+        public override bool IsAttackable
+        {
+            get
+            {
+                bool privilegeAllowsAttacks = Client.Account.PrivLevel <= (uint)ePrivLevel.Player || AttackablePowerEnabled;
+                return privilegeAllowsAttacks && base.IsAttackable;
+            }
+        }
 
         /// <summary>
         /// Can this player use cross realm items
@@ -5289,7 +5346,14 @@ namespace DOL.GS
             if (Duel != null && !IsDuelPartner(source as GameLiving))
                 Duel.Stop();
 
-            base.TakeDamage(source, damageType, damageAmount, criticalAmount);
+            if (GodModePowerEnabled)
+            {
+                // Combat messages are sent by OnAttackedByEnemy before this method is called.
+                // Still publish the damage event for scripts and effects, but do not change health.
+                Notify(GameObjectEvent.TakeDamage, this, new TakeDamageEventArgs(source, damageType, damageAmount, criticalAmount));
+            }
+            else
+                base.TakeDamage(source, damageType, damageAmount, criticalAmount);
 
             if (HasAbility(Abilities.DefensiveCombatPowerRegeneration))
                 Mana += (int)((damageAmount + criticalAmount) * 0.25);
