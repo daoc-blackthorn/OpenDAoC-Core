@@ -21,6 +21,7 @@ namespace DOL.Database
     {
         private static readonly Lock _lock = new();
         private static ConcurrentDictionary<Type, Func<DataObject>> _dataObjectConstructorCache = new();
+        private readonly ConcurrentDictionary<DataTableHandler, SelectReadPlan> _selectReadPlanCache = new();
 
         /// <summary>
         /// Create a new instance of <see cref="SqlObjectDatabase"/>
@@ -431,38 +432,22 @@ namespace DOL.Database
         /// <returns>Collection of DataObjects Sets matching Parametrized Where Expression</returns>
         protected override List<List<DataObject>> SelectObjectsImpl(DataTableHandler tableHandler, string whereExpression, IEnumerable<IEnumerable<QueryParameter>> parameters, Transaction.EIsolationLevel isolation)
         {
-            var columns = tableHandler.FieldElementBindings.ToArray();
-
-            string command = null;
-            if (!string.IsNullOrEmpty(whereExpression))
-                command = string.Format("SELECT {0} FROM `{1}` WHERE {2}",
-                                        string.Join(", ", columns.Select(col => string.Format("`{0}`", col.ColumnName))),
-                                        tableHandler.TableName,
-                                        whereExpression);
-            else
-                command = string.Format("SELECT {0} FROM `{1}`",
-                                        string.Join(", ", columns.Select(col => string.Format("`{0}`", col.ColumnName))),
-                                        tableHandler.TableName);
-
-            var primary = columns.FirstOrDefault(col => col.PrimaryKey != null);
+            SelectReadPlan readPlan = GetSelectReadPlan(tableHandler);
+            string command = string.IsNullOrEmpty(whereExpression)
+                ? readPlan.SelectFromExpression
+                : $"{readPlan.SelectFromExpression} WHERE {whereExpression}";
             var dataObjects = new List<List<DataObject>>();
-            ExecuteSelectImpl(command, parameters, reader => FillQueryResultList(reader, tableHandler, columns, primary, dataObjects));
+            ExecuteSelectImpl(command, parameters, reader => FillQueryResultList(reader, readPlan, dataObjects));
 
             return dataObjects;
         }
 
         protected override List<List<DataObject>> MultipleSelectObjectsImpl(DataTableHandler tableHandler, IEnumerable<WhereClause> whereClauseBatch)
         {
-            var columns = tableHandler.FieldElementBindings.ToArray();
-
-            string selectFromExpression = string.Format("SELECT {0} FROM `{1}` ",
-                                        string.Join(", ", columns.Select(col => string.Format("`{0}`", col.ColumnName))),
-                                        tableHandler.TableName);
-
-            var primary = columns.FirstOrDefault(col => col.PrimaryKey != null);
+            SelectReadPlan readPlan = GetSelectReadPlan(tableHandler);
             var dataObjects = new List<List<DataObject>>();
 
-            ExecuteSelectImpl(selectFromExpression, whereClauseBatch, reader => FillQueryResultList(reader, tableHandler, columns, primary, dataObjects));
+            ExecuteSelectImpl(readPlan.SelectFromExpression + " ", whereClauseBatch, reader => FillQueryResultList(reader, readPlan, dataObjects));
 
             return dataObjects;
         }
@@ -474,12 +459,12 @@ namespace DOL.Database
 
             StringBuilder commandText = new();
             List<QueryParameter> parameters = new();
-            List<(DataTableHandler Handler, ElementBinding[] Columns, ElementBinding Primary)> resultShapes = new(queries.Count);
+            SelectReadPlan[] resultShapes = new SelectReadPlan[queries.Count];
 
             for (int queryIndex = 0; queryIndex < queries.Count; queryIndex++)
             {
                 SelectQuery query = queries[queryIndex];
-                ElementBinding[] columns = query.TableHandler.FieldElementBindings.ToArray();
+                SelectReadPlan readPlan = GetSelectReadPlan(query.TableHandler);
                 string whereText = query.WhereClause.ParameterizedText;
 
                 // Every WhereClause starts parameter names at @a. Make them unique
@@ -494,14 +479,11 @@ namespace DOL.Database
                 if (queryIndex != 0)
                     commandText.AppendLine(";");
 
-                commandText.Append("SELECT ")
-                    .AppendJoin(", ", columns.Select(column => $"`{column.ColumnName}`"))
-                    .Append(" FROM `")
-                    .Append(query.TableHandler.TableName)
-                    .Append("` ")
+                commandText.Append(readPlan.SelectFromExpression)
+                    .Append(' ')
                     .Append(whereText);
 
-                resultShapes.Add((query.TableHandler, columns, columns.FirstOrDefault(column => column.PrimaryKey != null)));
+                resultShapes[queryIndex] = readPlan;
             }
 
             List<List<DataObject>> resultSets = new(queries.Count);
@@ -512,7 +494,7 @@ namespace DOL.Database
         private void ExecuteMultiResultSelectImpl(
             string commandText,
             IReadOnlyList<QueryParameter> parameters,
-            IReadOnlyList<(DataTableHandler Handler, ElementBinding[] Columns, ElementBinding Primary)> resultShapes,
+            IReadOnlyList<SelectReadPlan> resultShapes,
             List<List<DataObject>> resultSets)
         {
             if (log.IsDebugEnabled)
@@ -540,8 +522,7 @@ namespace DOL.Database
 
                     for (int resultIndex = 0; resultIndex < resultShapes.Count; resultIndex++)
                     {
-                        var shape = resultShapes[resultIndex];
-                        FillQueryResultList(reader, shape.Handler, shape.Columns, shape.Primary, resultSets);
+                        FillQueryResultList(reader, resultShapes[resultIndex], resultSets);
 
                         if (resultIndex + 1 < resultShapes.Count && !reader.NextResult())
                             throw new DatabaseException($"Expected {resultShapes.Count} relation result sets but received {resultIndex + 1}.");
@@ -575,29 +556,34 @@ namespace DOL.Database
             while (repeat);
         }
 
-        private void FillQueryResultList(IDataReader reader, DataTableHandler tableHandler, ElementBinding[] columns, ElementBinding primary, List<List<DataObject>> resultList)
+        private SelectReadPlan GetSelectReadPlan(DataTableHandler tableHandler)
+        {
+            return _selectReadPlanCache.GetOrAdd(tableHandler, static handler => new SelectReadPlan(handler));
+        }
+
+        private void FillQueryResultList(IDataReader reader, SelectReadPlan readPlan, List<List<DataObject>> resultList)
         {
             List<DataObject> list = new();
-            object[] buffer = ArrayPool<object>.Shared.Rent(columns.Length);
+            object[] buffer = ArrayPool<object>.Shared.Rent(readPlan.Columns.Length);
 
             try
             {
                 while (reader.Read())
                 {
                     reader.GetValues(buffer);
-                    DataObject obj = _dataObjectConstructorCache.GetOrAdd(tableHandler.ObjectType, (key) => CompiledConstructorFactory.CompileConstructor(key, []) as Func<DataObject>)();
+                    DataObject obj = _dataObjectConstructorCache.GetOrAdd(readPlan.TableHandler.ObjectType, (key) => CompiledConstructorFactory.CompileConstructor(key, []) as Func<DataObject>)();
 
                     // Fill Object
                     var current = 0;
-                    foreach (var column in columns)
+                    foreach (var column in readPlan.Columns)
                     {
                         DatabaseSetValue(obj, column, buffer[current]);
                         current++;
                     }
 
                     // Set Primary Key
-                    if (primary != null)
-                        obj.ObjectId = primary.GetValue(obj).ToString();
+                    if (readPlan.PrimaryKey != null)
+                        obj.ObjectId = readPlan.PrimaryKey.GetValue(obj).ToString();
 
                     list.Add(obj);
                     obj.Dirty = false;
@@ -610,6 +596,22 @@ namespace DOL.Database
             finally
             {
                 ArrayPool<object>.Shared.Return(buffer);
+            }
+        }
+
+        private sealed class SelectReadPlan
+        {
+            public DataTableHandler TableHandler { get; }
+            public ElementBinding[] Columns { get; }
+            public ElementBinding PrimaryKey { get; }
+            public string SelectFromExpression { get; }
+
+            public SelectReadPlan(DataTableHandler tableHandler)
+            {
+                TableHandler = tableHandler;
+                Columns = tableHandler.FieldElementBindings;
+                PrimaryKey = tableHandler.PrimaryKey;
+                SelectFromExpression = $"SELECT {string.Join(", ", Columns.Select(column => $"`{column.ColumnName}`"))} FROM `{tableHandler.TableName}`";
             }
         }
 
