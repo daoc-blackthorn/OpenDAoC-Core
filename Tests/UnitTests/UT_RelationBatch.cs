@@ -94,6 +94,40 @@ public class UT_RelationBatch
         });
     }
 
+    [Test]
+    public void MultipleParents_MapStringKeysCaseInsensitively()
+    {
+        CaseChangingSqliteObjectDatabase database = CreateDatabase<CaseChangingSqliteObjectDatabase>();
+        Seed(database);
+
+        RelationBatchParent parent = database.SelectObject<RelationBatchParent>(DB.Column(nameof(RelationBatchParent.Id)).IsEqualTo("parent-1"));
+
+        Assert.That(parent.FirstChildren.Select(child => child.Value), Is.EquivalentTo(new[] { "first-a", "first-b" }));
+    }
+
+    [Test]
+    public void RelationBatch_WithMoreThanQParameters_RenamesWithoutCollisions()
+    {
+        CountingSqliteObjectDatabase database = CreateDatabase<CountingSqliteObjectDatabase>();
+
+        for (int index = 0; index < 20; index++)
+        {
+            string parentId = $"parent-{index}";
+            Assert.That(database.AddObject(new RelationBatchParent { Id = parentId }), Is.True);
+            Assert.That(database.AddObject(new RelationBatchFirstChild { ParentId = parentId, Value = $"child-{index}" }), Is.True);
+        }
+
+        database.ResetConnectionCount();
+        List<RelationBatchParent> parents = database.SelectAllObjects<RelationBatchParent>();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(parents, Has.Count.EqualTo(20));
+            Assert.That(parents.All(parent => parent.FirstChildren?.Length == 1), Is.True);
+            Assert.That(database.ConnectionCount, Is.EqualTo(2), "The batch should not fall back to per-relation queries.");
+        });
+    }
+
     private T CreateDatabase<T>() where T : CountingSqliteObjectDatabase
     {
         string databaseFile = Path.Combine(Path.GetTempPath(), $"dol-relation-batch-{Guid.NewGuid():N}.sqlite");
@@ -143,6 +177,21 @@ public class UT_RelationBatch
             return queries
                 .Select(query => MultipleSelectObjectsImpl(query.TableHandler, [query.WhereClause]).Single())
                 .ToList();
+        }
+    }
+
+    public sealed class CaseChangingSqliteObjectDatabase : CountingSqliteObjectDatabase
+    {
+        public CaseChangingSqliteObjectDatabase(string connectionString) : base(connectionString) { }
+
+        protected override List<List<DataObject>> MultipleSelectObjectsImpl(IReadOnlyList<SelectQuery> queries)
+        {
+            List<List<DataObject>> results = base.MultipleSelectObjectsImpl(queries);
+
+            foreach (RelationBatchFirstChild child in results.SelectMany(result => result).OfType<RelationBatchFirstChild>())
+                child.ParentId = child.ParentId.ToUpperInvariant();
+
+            return results;
         }
     }
 }

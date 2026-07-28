@@ -466,15 +466,18 @@ namespace DOL.Database
                 SelectQuery query = queries[queryIndex];
                 SelectReadPlan readPlan = GetSelectReadPlan(query.TableHandler);
                 string whereText = query.WhereClause.ParameterizedText;
+                Dictionary<string, string> parameterNames = new(StringComparer.Ordinal);
 
                 // Every WhereClause starts parameter names at @a. Make them unique
                 // before combining the statements into one command.
-                foreach (QueryParameter parameter in query.WhereClause.Parameters.OrderByDescending(parameter => parameter.Name.Length))
+                foreach (QueryParameter parameter in query.WhereClause.Parameters)
                 {
                     string uniqueName = $"@q{queryIndex}_{parameter.Name.AsSpan(1)}";
-                    whereText = whereText.Replace(parameter.Name, uniqueName, StringComparison.Ordinal);
+                    parameterNames.Add(parameter.Name, uniqueName);
                     parameters.Add(new QueryParameter(uniqueName, parameter.Value, parameter.ValueType));
                 }
+
+                whereText = RenameQueryParameters(whereText, parameterNames);
 
                 if (queryIndex != 0)
                     commandText.AppendLine(";");
@@ -489,6 +492,36 @@ namespace DOL.Database
             List<List<DataObject>> resultSets = new(queries.Count);
             ExecuteMultiResultSelectImpl(commandText.ToString(), parameters, resultShapes, resultSets);
             return resultSets;
+        }
+
+        private static string RenameQueryParameters(string queryText, IReadOnlyDictionary<string, string> parameterNames)
+        {
+            StringBuilder renamed = new(queryText.Length + parameterNames.Count * 3);
+            int copyStart = 0;
+
+            for (int index = 0; index < queryText.Length; index++)
+            {
+                if (queryText[index] != '@')
+                    continue;
+
+                int parameterEnd = index + 1;
+
+                while (parameterEnd < queryText.Length && queryText[parameterEnd] is >= 'a' and <= 'z')
+                    parameterEnd++;
+
+                string parameterName = queryText[index..parameterEnd];
+
+                if (!parameterNames.TryGetValue(parameterName, out string uniqueName))
+                    continue;
+
+                renamed.Append(queryText, copyStart, index - copyStart);
+                renamed.Append(uniqueName);
+                copyStart = parameterEnd;
+                index = parameterEnd - 1;
+            }
+
+            renamed.Append(queryText, copyStart, queryText.Length - copyStart);
+            return renamed.ToString();
         }
 
         private void ExecuteMultiResultSelectImpl(

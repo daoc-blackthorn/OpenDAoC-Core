@@ -664,7 +664,9 @@ namespace DOL.Database
 			}
 			else
 			{
-				HashSet<object> uniqueKeys = new();
+				HashSet<object> uniqueKeys = descriptor.CompareAsString
+					? new HashSet<object>(RelationKeyComparer.Instance)
+					: new HashSet<object>();
 
 				foreach (DataObject dataObject in dataObjects)
 				{
@@ -701,7 +703,9 @@ namespace DOL.Database
 				return;
 			}
 
-			Dictionary<object, List<DataObject>> resultsByKey = new();
+			Dictionary<object, List<DataObject>> resultsByKey = descriptor.CompareAsString
+				? new Dictionary<object, List<DataObject>>(RelationKeyComparer.Instance)
+				: new Dictionary<object, List<DataObject>>();
 
 			foreach (DataObject result in queryResults)
 			{
@@ -840,6 +844,21 @@ namespace DOL.Database
 				IsArray = relationBind.ValueType.HasElementType;
 				RemoteFieldIsPrimaryKey = remoteFieldIsPrimaryKey;
 				CompareAsString = localBind.ValueType == typeof(string) || remoteBind.ValueType == typeof(string);
+			}
+		}
+
+		private sealed class RelationKeyComparer : IEqualityComparer<object>
+		{
+			public static RelationKeyComparer Instance { get; } = new();
+
+			public new bool Equals(object left, object right)
+			{
+				return string.Equals(left?.ToString(), right?.ToString(), StringComparison.OrdinalIgnoreCase);
+			}
+
+			public int GetHashCode(object value)
+			{
+				return value == null ? 0 : StringComparer.OrdinalIgnoreCase.GetHashCode(value.ToString());
 			}
 		}
 
