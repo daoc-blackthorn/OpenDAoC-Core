@@ -40,10 +40,11 @@ namespace DOL.Database
 		/// <summary>
 		/// Retrieve Element Bindings for DataTable Fields Only
 		/// </summary>
-		public IEnumerable<ElementBinding> FieldElementBindings 
-		{
-			get { return ElementBindings.Where(bind => bind.Relation == null); }
-		}
+		public ElementBinding[] FieldElementBindings { get; private set; }
+		/// <summary>
+		/// Retrieve Element Bindings for Relations Only
+		/// </summary>
+		public ElementBinding[] RelationElementBindings { get; private set; }
 		/// <summary>
 		/// Data Table Handled
 		/// </summary>
@@ -51,11 +52,11 @@ namespace DOL.Database
 		/// <summary>
 		/// Retrieve Single Primary Key Binding
 		/// </summary>
-		public ElementBinding PrimaryKey { get { return PrimaryKeys.FirstOrDefault(); } }
+		public ElementBinding PrimaryKey { get; private set; }
 		/// <summary>
 		/// Retrieve Multiple Primary Key Binding (Future Support)
 		/// </summary>
-		public ElementBinding[] PrimaryKeys { get { return Table.PrimaryKey.Select(col => ElementBindings.FirstOrDefault(bind => bind.ColumnName.Equals(col.ColumnName, StringComparison.OrdinalIgnoreCase))).ToArray(); } }
+		public ElementBinding[] PrimaryKeys { get; private set; }
 		
 		/// <summary>
 		/// Create new instance of <see cref="DataTableHandler"/>
@@ -79,6 +80,7 @@ namespace DOL.Database
 			
 			// Parse Table Type
 			ElementBindings = ObjectType.GetMembers().Select(member => new ElementBinding(member)).Where(bind => bind.IsDataElementBinding).ToArray();
+			FieldElementBindings = ElementBindings.Where(bind => bind.Relation == null).ToArray();
 			
 			// Views Can't Handle Auto GUID Key
 			if (!isView)
@@ -97,6 +99,10 @@ namespace DOL.Database
 					                                         	                   string.Format("{0}_ID", TableName))
 					                                         }).ToArray();
 			}
+
+			// Cache immutable binding subsets after the optional generated key is added.
+			FieldElementBindings = ElementBindings.Where(bind => bind.Relation == null).ToArray();
+			RelationElementBindings = ElementBindings.Where(bind => bind.Relation != null).ToArray();
 			
 			// Prepare Table
 			Table = new DataTable(TableName);
@@ -162,6 +168,11 @@ namespace DOL.Database
 				Table.Constraints.Add(new UniqueConstraint(string.Format("U_{0}_{1}", TableName, bind.ColumnName),
 				                                           columns.Select(column => Table.Columns[column]).ToArray()));
 			}
+
+			PrimaryKeys = Table.PrimaryKey
+				.Select(column => FieldElementBindings.First(bind => bind.ColumnName.Equals(column.ColumnName, StringComparison.OrdinalIgnoreCase)))
+				.ToArray();
+			PrimaryKey = PrimaryKeys.FirstOrDefault();
 		}
 		
 		#region PreCache Handling

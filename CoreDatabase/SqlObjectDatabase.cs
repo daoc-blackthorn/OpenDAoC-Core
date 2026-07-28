@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using DOL.Database.Attributes;
 using DOL.Database.Connection;
@@ -20,6 +21,7 @@ namespace DOL.Database
     {
         private static readonly Lock _lock = new();
         private static ConcurrentDictionary<Type, Func<DataObject>> _dataObjectConstructorCache = new();
+        private readonly ConcurrentDictionary<DataTableHandler, SelectReadPlan> _selectReadPlanCache = new();
 
         /// <summary>
         /// Create a new instance of <see cref="SqlObjectDatabase"/>
@@ -430,65 +432,191 @@ namespace DOL.Database
         /// <returns>Collection of DataObjects Sets matching Parametrized Where Expression</returns>
         protected override List<List<DataObject>> SelectObjectsImpl(DataTableHandler tableHandler, string whereExpression, IEnumerable<IEnumerable<QueryParameter>> parameters, Transaction.EIsolationLevel isolation)
         {
-            var columns = tableHandler.FieldElementBindings.ToArray();
-
-            string command = null;
-            if (!string.IsNullOrEmpty(whereExpression))
-                command = string.Format("SELECT {0} FROM `{1}` WHERE {2}",
-                                        string.Join(", ", columns.Select(col => string.Format("`{0}`", col.ColumnName))),
-                                        tableHandler.TableName,
-                                        whereExpression);
-            else
-                command = string.Format("SELECT {0} FROM `{1}`",
-                                        string.Join(", ", columns.Select(col => string.Format("`{0}`", col.ColumnName))),
-                                        tableHandler.TableName);
-
-            var primary = columns.FirstOrDefault(col => col.PrimaryKey != null);
+            SelectReadPlan readPlan = GetSelectReadPlan(tableHandler);
+            string command = string.IsNullOrEmpty(whereExpression)
+                ? readPlan.SelectFromExpression
+                : $"{readPlan.SelectFromExpression} WHERE {whereExpression}";
             var dataObjects = new List<List<DataObject>>();
-            ExecuteSelectImpl(command, parameters, reader => FillQueryResultList(reader, tableHandler, columns, primary, dataObjects));
+            ExecuteSelectImpl(command, parameters, reader => FillQueryResultList(reader, readPlan, dataObjects));
 
             return dataObjects;
         }
 
         protected override List<List<DataObject>> MultipleSelectObjectsImpl(DataTableHandler tableHandler, IEnumerable<WhereClause> whereClauseBatch)
         {
-            var columns = tableHandler.FieldElementBindings.ToArray();
-
-            string selectFromExpression = string.Format("SELECT {0} FROM `{1}` ",
-                                        string.Join(", ", columns.Select(col => string.Format("`{0}`", col.ColumnName))),
-                                        tableHandler.TableName);
-
-            var primary = columns.FirstOrDefault(col => col.PrimaryKey != null);
+            SelectReadPlan readPlan = GetSelectReadPlan(tableHandler);
             var dataObjects = new List<List<DataObject>>();
 
-            ExecuteSelectImpl(selectFromExpression, whereClauseBatch, reader => FillQueryResultList(reader, tableHandler, columns, primary, dataObjects));
+            ExecuteSelectImpl(readPlan.SelectFromExpression + " ", whereClauseBatch, reader => FillQueryResultList(reader, readPlan, dataObjects));
 
             return dataObjects;
         }
 
-        private void FillQueryResultList(IDataReader reader, DataTableHandler tableHandler, ElementBinding[] columns, ElementBinding primary, List<List<DataObject>> resultList)
+        protected override List<List<DataObject>> MultipleSelectObjectsImpl(IReadOnlyList<SelectQuery> queries)
+        {
+            if (queries.Count == 0)
+                return [];
+
+            StringBuilder commandText = new();
+            List<QueryParameter> parameters = new();
+            SelectReadPlan[] resultShapes = new SelectReadPlan[queries.Count];
+
+            for (int queryIndex = 0; queryIndex < queries.Count; queryIndex++)
+            {
+                SelectQuery query = queries[queryIndex];
+                SelectReadPlan readPlan = GetSelectReadPlan(query.TableHandler);
+                string whereText = query.WhereClause.ParameterizedText;
+                Dictionary<string, string> parameterNames = new(StringComparer.Ordinal);
+
+                // Every WhereClause starts parameter names at @a. Make them unique
+                // before combining the statements into one command.
+                foreach (QueryParameter parameter in query.WhereClause.Parameters)
+                {
+                    string uniqueName = $"@q{queryIndex}_{parameter.Name.AsSpan(1)}";
+                    parameterNames.Add(parameter.Name, uniqueName);
+                    parameters.Add(new QueryParameter(uniqueName, parameter.Value, parameter.ValueType));
+                }
+
+                whereText = RenameQueryParameters(whereText, parameterNames);
+
+                if (queryIndex != 0)
+                    commandText.AppendLine(";");
+
+                commandText.Append(readPlan.SelectFromExpression)
+                    .Append(' ')
+                    .Append(whereText);
+
+                resultShapes[queryIndex] = readPlan;
+            }
+
+            List<List<DataObject>> resultSets = new(queries.Count);
+            ExecuteMultiResultSelectImpl(commandText.ToString(), parameters, resultShapes, resultSets);
+            return resultSets;
+        }
+
+        private static string RenameQueryParameters(string queryText, IReadOnlyDictionary<string, string> parameterNames)
+        {
+            StringBuilder renamed = new(queryText.Length + parameterNames.Count * 3);
+            int copyStart = 0;
+
+            for (int index = 0; index < queryText.Length; index++)
+            {
+                if (queryText[index] != '@')
+                    continue;
+
+                int parameterEnd = index + 1;
+
+                while (parameterEnd < queryText.Length && queryText[parameterEnd] is >= 'a' and <= 'z')
+                    parameterEnd++;
+
+                string parameterName = queryText[index..parameterEnd];
+
+                if (!parameterNames.TryGetValue(parameterName, out string uniqueName))
+                    continue;
+
+                renamed.Append(queryText, copyStart, index - copyStart);
+                renamed.Append(uniqueName);
+                copyStart = parameterEnd;
+                index = parameterEnd - 1;
+            }
+
+            renamed.Append(queryText, copyStart, queryText.Length - copyStart);
+            return renamed.ToString();
+        }
+
+        private void ExecuteMultiResultSelectImpl(
+            string commandText,
+            IReadOnlyList<QueryParameter> parameters,
+            IReadOnlyList<SelectReadPlan> resultShapes,
+            List<List<DataObject>> resultSets)
+        {
+            if (log.IsDebugEnabled)
+                log.DebugFormat("ExecuteMultiResultSelectImpl: {0}", commandText);
+
+            bool repeat;
+
+            do
+            {
+                repeat = false;
+                resultSets.Clear();
+                DbConnection conn = null;
+
+                try
+                {
+                    conn = CreateConnection(ConnectionString);
+
+                    using DbCommand cmd = conn.CreateCommand();
+                    cmd.CommandText = commandText;
+                    FillSQLParameter(parameters, cmd.Parameters);
+                    OpenConnection(conn);
+                    long start = MonotonicTime.NowMs;
+
+                    using DbDataReader reader = cmd.ExecuteReader();
+
+                    for (int resultIndex = 0; resultIndex < resultShapes.Count; resultIndex++)
+                    {
+                        FillQueryResultList(reader, resultShapes[resultIndex], resultSets);
+
+                        if (resultIndex + 1 < resultShapes.Count && !reader.NextResult())
+                            throw new DatabaseException($"Expected {resultShapes.Count} relation result sets but received {resultIndex + 1}.");
+                    }
+
+                    long elapsed = MonotonicTime.NowMs - start;
+
+                    if (log.IsDebugEnabled)
+                        log.DebugFormat("ExecuteMultiResultSelectImpl: SQL select exec time {0}ms for {1} result sets", elapsed, resultShapes.Count);
+                    else if (log.IsWarnEnabled && elapsed > LONG_EXEC_THRESHOLD)
+                        log.WarnFormat("ExecuteMultiResultSelectImpl: SQL select took {0}ms for {1} result sets!", elapsed, resultShapes.Count);
+                }
+                catch (Exception e)
+                {
+                    if (!HandleException(e))
+                    {
+                        if (log.IsErrorEnabled)
+                            log.ErrorFormat("ExecuteMultiResultSelectImpl: Unhandled exception in multi-result select\n{0}", e);
+
+                        throw;
+                    }
+
+                    repeat = true;
+                }
+                finally
+                {
+                    if (conn != null)
+                        CloseConnection(conn);
+                }
+            }
+            while (repeat);
+        }
+
+        private SelectReadPlan GetSelectReadPlan(DataTableHandler tableHandler)
+        {
+            return _selectReadPlanCache.GetOrAdd(tableHandler, static handler => new SelectReadPlan(handler));
+        }
+
+        private void FillQueryResultList(IDataReader reader, SelectReadPlan readPlan, List<List<DataObject>> resultList)
         {
             List<DataObject> list = new();
-            object[] buffer = ArrayPool<object>.Shared.Rent(columns.Length);
+            object[] buffer = ArrayPool<object>.Shared.Rent(readPlan.Columns.Length);
 
             try
             {
                 while (reader.Read())
                 {
                     reader.GetValues(buffer);
-                    DataObject obj = _dataObjectConstructorCache.GetOrAdd(tableHandler.ObjectType, (key) => CompiledConstructorFactory.CompileConstructor(key, []) as Func<DataObject>)();
+                    DataObject obj = _dataObjectConstructorCache.GetOrAdd(readPlan.TableHandler.ObjectType, (key) => CompiledConstructorFactory.CompileConstructor(key, []) as Func<DataObject>)();
 
                     // Fill Object
                     var current = 0;
-                    foreach (var column in columns)
+                    foreach (var column in readPlan.Columns)
                     {
                         DatabaseSetValue(obj, column, buffer[current]);
                         current++;
                     }
 
                     // Set Primary Key
-                    if (primary != null)
-                        obj.ObjectId = primary.GetValue(obj).ToString();
+                    if (readPlan.PrimaryKey != null)
+                        obj.ObjectId = readPlan.PrimaryKey.GetValue(obj).ToString();
 
                     list.Add(obj);
                     obj.Dirty = false;
@@ -501,6 +629,22 @@ namespace DOL.Database
             finally
             {
                 ArrayPool<object>.Shared.Return(buffer);
+            }
+        }
+
+        private sealed class SelectReadPlan
+        {
+            public DataTableHandler TableHandler { get; }
+            public ElementBinding[] Columns { get; }
+            public ElementBinding PrimaryKey { get; }
+            public string SelectFromExpression { get; }
+
+            public SelectReadPlan(DataTableHandler tableHandler)
+            {
+                TableHandler = tableHandler;
+                Columns = tableHandler.FieldElementBindings;
+                PrimaryKey = tableHandler.PrimaryKey;
+                SelectFromExpression = $"SELECT {string.Join(", ", Columns.Select(column => $"`{column.ColumnName}`"))} FROM `{tableHandler.TableName}`";
             }
         }
 
