@@ -507,53 +507,44 @@ namespace DOL.Database
 		/// <param name="force">Force Refresh even if Autoload is False</param>
 		protected virtual void FillObjectRelations(IEnumerable<DataObject> dataObjects, bool force)
 		{
-			var groups = dataObjects.GroupBy(obj => obj.GetType());
-			
-			foreach (var grp in groups)
+			DataObject[] objects = dataObjects.Where(obj => obj != null).ToArray();
+			List<RelationLoadPlan> relationPlans = new();
+
+			foreach (IGrouping<Type, DataObject> group in objects.GroupBy(obj => obj.GetType()))
 			{
-				var dataType = grp.Key;
-				var tableName = AttributeUtil.GetTableOrViewName(dataType);
+				Type dataType = group.Key;
+				string tableName = AttributeUtil.GetTableOrViewName(dataType);
+				DataObject[] groupedObjects = group.ToArray();
 
 				try
 				{
 					if (!TableDatasets.TryGetValue(tableName, out DataTableHandler tableHandler))
 						throw new DatabaseException(string.Format("Table {0} is not registered for Database Connection...", tableName));
 
-					if (!tableHandler.HasRelations)
+					foreach (ElementBinding relation in tableHandler.ElementBindings.Where(bind => bind.Relation != null))
 					{
-						TakeSnapshots(grp);
-						continue;
-					}
-
-					var relations = tableHandler.ElementBindings.Where(bind => bind.Relation != null);
-					foreach (var relation in relations)
-					{
-						// Check if Loading is needed
 						if (!(relation.Relation.AutoLoad || force))
 							continue;
-						
-						var remoteName = AttributeUtil.GetTableOrViewName(relation.ValueType);
+
 						try
 						{
-							DataTableHandler remoteHandler;
-							if (!TableDatasets.TryGetValue(remoteName, out remoteHandler))
+							Type relatedType = relation.ValueType.HasElementType ? relation.ValueType.GetElementType() : relation.ValueType;
+							string remoteName = AttributeUtil.GetTableOrViewName(relatedType);
+
+							if (!TableDatasets.TryGetValue(remoteName, out DataTableHandler remoteHandler))
 								throw new DatabaseException(string.Format("Table {0} is not registered for Database Connection...", remoteName));
 
-							// Select Object On Relation Constraint
-							var localBind = tableHandler.FieldElementBindings.Single(bind => bind.ColumnName.Equals(relation.Relation.LocalField, StringComparison.OrdinalIgnoreCase));
-							var remoteBind = remoteHandler.FieldElementBindings.Single(bind => bind.ColumnName.Equals(relation.Relation.RemoteField, StringComparison.OrdinalIgnoreCase));
-							
-							FillObjectRelationsImpl(relation, localBind, remoteBind, remoteHandler, grp);
+							ElementBinding localBind = tableHandler.FieldElementBindings.Single(bind => bind.ColumnName.Equals(relation.Relation.LocalField, StringComparison.OrdinalIgnoreCase));
+							ElementBinding remoteBind = remoteHandler.FieldElementBindings.Single(bind => bind.ColumnName.Equals(relation.Relation.RemoteField, StringComparison.OrdinalIgnoreCase));
+							relationPlans.Add(CreateRelationLoadPlan(relation, localBind, remoteBind, remoteHandler, groupedObjects));
 						}
 						catch (Exception re)
 						{
 							if (log.IsErrorEnabled)
 								log.ErrorFormat("Could not Retrieve Objects from Relation (Table {0}, Local {1}, Remote Table {2}, Remote {3})\n{4}", tableName,
-								                relation.Relation.LocalField, AttributeUtil.GetTableOrViewName(relation.ValueType), relation.Relation.RemoteField, re);
+									relation.Relation.LocalField, AttributeUtil.GetTableOrViewName(relation.ValueType), relation.Relation.RemoteField, re);
 						}
 					}
-
-					TakeSnapshots(grp);
 				}
 				catch (Exception e)
 				{
@@ -562,11 +553,65 @@ namespace DOL.Database
 				}
 			}
 
-			static void TakeSnapshots(IGrouping<Type, DataObject> group)
+			RelationLoadPlan[] queriedPlans = relationPlans.Where(plan => plan.Query != null).ToArray();
+
+			if (queriedPlans.Length != 0)
 			{
-				foreach (DataObject dataObject in group)
-					dataObject.TakeSnapshot();
+				IReadOnlyList<SelectQuery> queries = queriedPlans.Select(plan => plan.Query).ToArray();
+
+				try
+				{
+					List<List<DataObject>> resultSets = MultipleSelectObjectsImpl(queries);
+
+					if (resultSets.Count != queriedPlans.Length)
+						throw new DatabaseException($"Relation batch returned {resultSets.Count} result sets for {queriedPlans.Length} queries.");
+
+					for (int i = 0; i < queriedPlans.Length; i++)
+						queriedPlans[i].SetQueryResults(resultSets[i]);
+				}
+				catch (Exception batchException)
+				{
+					if (log.IsWarnEnabled)
+						log.WarnFormat("Could not retrieve relation batch; retrying each relation separately.\n{0}", batchException);
+
+					foreach (RelationLoadPlan plan in queriedPlans)
+					{
+						try
+						{
+							List<DataObject> results = MultipleSelectObjectsImpl(plan.Query.TableHandler, [plan.Query.WhereClause]).Single();
+							plan.SetQueryResults(results);
+						}
+						catch (Exception relationException)
+						{
+							if (log.IsErrorEnabled)
+								log.ErrorFormat("Could not retrieve relation {0}.\n{1}", plan.RelationBind.ColumnName, relationException);
+						}
+					}
+				}
 			}
+
+			List<DataObject> relatedObjects = new();
+
+			foreach (RelationLoadPlan plan in relationPlans)
+			{
+				try
+				{
+					AssignRelations(plan);
+					foreach (DataObject[] results in plan.ResultsByObject)
+						relatedObjects.AddRange(results);
+				}
+				catch (Exception e)
+				{
+					if (log.IsErrorEnabled)
+						log.ErrorFormat("Could not assign relation {0}\n{1}", plan.RelationBind.ColumnName, e);
+				}
+			}
+
+			if (relatedObjects.Count != 0)
+				FillObjectRelations(relatedObjects, false);
+
+			foreach (DataObject dataObject in objects)
+				dataObject.TakeSnapshot();
 		}
 
 		/// <summary>
@@ -577,58 +622,41 @@ namespace DOL.Database
 		/// <param name="remoteBind">Remote Binding for Column Match</param>
 		/// <param name="remoteHandler">Remote Table Handler for Cache Retrieving</param>
 		/// <param name="dataObjects">DataObjects to Populate</param>
-		protected virtual void FillObjectRelationsImpl(ElementBinding relationBind, ElementBinding localBind, ElementBinding remoteBind, DataTableHandler remoteHandler, IEnumerable<DataObject> dataObjects)
+		private RelationLoadPlan CreateRelationLoadPlan(ElementBinding relationBind, ElementBinding localBind, ElementBinding remoteBind, DataTableHandler remoteHandler, DataObject[] dataObjects)
 		{
-			Type type = relationBind.ValueType;
-			bool isElementType = false;
-
-			if (type.HasElementType)
-			{
-				type = type.GetElementType();
-				isElementType = true;
-			}
+			RelationLoadPlan plan = new(relationBind, localBind, remoteBind, remoteHandler, dataObjects);
 
 			if (remoteHandler.UsesPreCaching)
 			{
-				// This Select directly corresponds to each item in dataObjects, maintaining order.
-				var objsResults = dataObjects.Select(obj =>
+				plan.ResultsByObject = dataObjects.Select(obj =>
 				{
 					if (remoteHandler.PrimaryKeys.All(pk => pk.ColumnName.Equals(remoteBind.ColumnName, StringComparison.OrdinalIgnoreCase)))
 					{
 						object local = localBind.GetValue(obj);
 
 						if (local == null)
-							return Enumerable.Empty<DataObject>();
+							return [];
 
 						DataObject retrieve = remoteHandler.GetPreCachedObject(local);
-						
-						if (retrieve == null)
-							return Enumerable.Empty<DataObject>();
-							
-						return [retrieve];
+						return retrieve == null ? [] : [retrieve];
 					}
-					else
+
+					return remoteHandler.SearchPreCachedObjects(rem =>
 					{
-						return remoteHandler.SearchPreCachedObjects(rem =>
-						{
-							object local = localBind.GetValue(obj);
-							object remote = remoteBind.GetValue(rem);
+						object local = localBind.GetValue(obj);
+						object remote = remoteBind.GetValue(rem);
 
-							if (local == null || remote == null)
-								return false;
+						if (local == null || remote == null)
+							return false;
 
-							if (localBind.ValueType == typeof(string) || remoteBind.ValueType == typeof(string))
-								return remote.ToString().Equals(local.ToString(), StringComparison.OrdinalIgnoreCase);
+						if (localBind.ValueType == typeof(string) || remoteBind.ValueType == typeof(string))
+							return remote.ToString().Equals(local.ToString(), StringComparison.OrdinalIgnoreCase);
 
-							return remote.Equals(local);
-						});
-					}
-				});
+						return remote.Equals(local);
+					}).ToArray();
+				}).ToArray();
 
-				var resultByObjsFromCache = dataObjects.Zip(objsResults, (dataObj, results) => new { DataObject = dataObj, Results = results });
-				AssignRelations(resultByObjsFromCache, isElementType, type, relationBind);
-				FillObjectRelations(resultByObjsFromCache.SelectMany(result => result.Results), false);
-				return;
+				return plan;
 			}
 
 			List<object> localKeys = dataObjects
@@ -638,57 +666,74 @@ namespace DOL.Database
 				.ToList();
 
 			if (localKeys.Count == 0)
-			{
-				foreach (DataObject obj in dataObjects)
-					relationBind.SetValue(obj, null);
+				return plan;
 
-				return;
-			}
-
-			WhereClause batchWhereClause = DB.Column(remoteBind.ColumnName).IsIn(localKeys);
-			IEnumerable<DataObject> allRelatedObjects = MultipleSelectObjectsImpl(remoteHandler, [batchWhereClause]).FirstOrDefault() ?? Enumerable.Empty<DataObject>();
-			ILookup<object, DataObject> relatedObjectsMap = allRelatedObjects.ToLookup(r => remoteBind.GetValue(r));
-
-			var resultByObjs = dataObjects.Select(obj =>
-			{
-				object localKeyValue = localBind.GetValue(obj);
-				IEnumerable<DataObject> related;
-
-				if (localKeyValue != null && relatedObjectsMap.Contains(localKeyValue))
-					related = relatedObjectsMap[localKeyValue];
-				else
-					related = [];
-
-				return new { DataObject = obj, Results = related };
-			});
-
-			AssignRelations(resultByObjs, isElementType, type, relationBind);
-			FillObjectRelations(resultByObjs.SelectMany(result => result.Results), false);
+			plan.Query = new SelectQuery(remoteHandler, DB.Column(remoteBind.ColumnName).IsIn(localKeys));
+			return plan;
 		}
 
-		private static void AssignRelations(IEnumerable<dynamic> resultByObjs, bool isElementType, Type type, ElementBinding relationBind)
+		private static void AssignRelations(RelationLoadPlan plan)
 		{
-			foreach (dynamic result in resultByObjs)
+			Type relationType = plan.RelationBind.ValueType;
+			bool isArray = relationType.HasElementType;
+			Type elementType = isArray ? relationType.GetElementType() : relationType;
+
+			for (int i = 0; i < plan.DataObjects.Length; i++)
 			{
-				// Cast the dynamic property to the non-generic IEnumerable.
-				// This ensures that the LINQ extension methods can be found at runtime,
-				// regardless of the underlying collection type (List<T>, T[], Array, etc.).
-				IEnumerable enumerableResults = result.Results;
+				DataObject[] results = plan.ResultsByObject[i];
 
-				if (isElementType)
+				if (isArray)
 				{
-					DataObject[] resultsArray = enumerableResults.Cast<DataObject>().ToArray();
-
-					if (resultsArray.Length != 0)
-					{
-						Array array = CastAndToArray(resultsArray.Cast<object>(), type);
-						relationBind.SetValue(result.DataObject, array);
-					}
+					if (results.Length != 0)
+						plan.RelationBind.SetValue(plan.DataObjects[i], CastAndToArray(results.Cast<object>(), elementType));
 					else
-						relationBind.SetValue(result.DataObject, null);
+						plan.RelationBind.SetValue(plan.DataObjects[i], null);
 				}
 				else
-					relationBind.SetValue(result.DataObject, enumerableResults.Cast<DataObject>().SingleOrDefault());
+					plan.RelationBind.SetValue(plan.DataObjects[i], results.SingleOrDefault());
+			}
+		}
+
+		private sealed class RelationLoadPlan
+		{
+			public ElementBinding RelationBind { get; }
+			public ElementBinding LocalBind { get; }
+			public ElementBinding RemoteBind { get; }
+			public DataTableHandler RemoteHandler { get; }
+			public DataObject[] DataObjects { get; }
+			public SelectQuery Query { get; set; }
+			public DataObject[][] ResultsByObject { get; set; }
+
+			public RelationLoadPlan(ElementBinding relationBind, ElementBinding localBind, ElementBinding remoteBind, DataTableHandler remoteHandler, DataObject[] dataObjects)
+			{
+				RelationBind = relationBind;
+				LocalBind = localBind;
+				RemoteBind = remoteBind;
+				RemoteHandler = remoteHandler;
+				DataObjects = dataObjects;
+				ResultsByObject = dataObjects.Select(_ => Array.Empty<DataObject>()).ToArray();
+			}
+
+			public void SetQueryResults(IEnumerable<DataObject> results)
+			{
+				ILookup<object, DataObject> relatedObjectsMap = results.ToLookup(result => RemoteBind.GetValue(result));
+				ResultsByObject = DataObjects.Select(dataObject =>
+				{
+					object localValue = LocalBind.GetValue(dataObject);
+					return localValue == null ? [] : relatedObjectsMap[localValue].ToArray();
+				}).ToArray();
+			}
+		}
+
+		protected sealed class SelectQuery
+		{
+			public DataTableHandler TableHandler { get; }
+			public WhereClause WhereClause { get; }
+
+			public SelectQuery(DataTableHandler tableHandler, WhereClause whereClause)
+			{
+				TableHandler = tableHandler;
+				WhereClause = whereClause;
 			}
 		}
 
@@ -906,6 +951,21 @@ namespace DOL.Database
 		protected abstract List<List<DataObject>> SelectObjectsImpl(DataTableHandler tableHandler, string whereExpression, IEnumerable<IEnumerable<QueryParameter>> parameters, Transaction.EIsolationLevel isolation);
 
 		protected abstract List<List<DataObject>> MultipleSelectObjectsImpl(DataTableHandler tableHandler, IEnumerable<WhereClause> whereClauseBatch);
+
+		/// <summary>
+		/// Executes heterogeneous selects in result-set order. SQL providers override this
+		/// to use one command and one database round trip; other providers retain the
+		/// sequential fallback.
+		/// </summary>
+		protected virtual List<List<DataObject>> MultipleSelectObjectsImpl(IReadOnlyList<SelectQuery> queries)
+		{
+			List<List<DataObject>> resultSets = new(queries.Count);
+
+			foreach (SelectQuery query in queries)
+				resultSets.Add(MultipleSelectObjectsImpl(query.TableHandler, [query.WhereClause]).Single());
+
+			return resultSets;
+		}
 
 		/// <summary>
 		/// Gets the number of objects in a given table in the database based on a given set of criteria. (where clause)

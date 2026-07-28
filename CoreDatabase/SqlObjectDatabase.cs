@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using DOL.Database.Attributes;
 using DOL.Database.Connection;
@@ -464,6 +465,114 @@ namespace DOL.Database
             ExecuteSelectImpl(selectFromExpression, whereClauseBatch, reader => FillQueryResultList(reader, tableHandler, columns, primary, dataObjects));
 
             return dataObjects;
+        }
+
+        protected override List<List<DataObject>> MultipleSelectObjectsImpl(IReadOnlyList<SelectQuery> queries)
+        {
+            if (queries.Count == 0)
+                return [];
+
+            StringBuilder commandText = new();
+            List<QueryParameter> parameters = new();
+            List<(DataTableHandler Handler, ElementBinding[] Columns, ElementBinding Primary)> resultShapes = new(queries.Count);
+
+            for (int queryIndex = 0; queryIndex < queries.Count; queryIndex++)
+            {
+                SelectQuery query = queries[queryIndex];
+                ElementBinding[] columns = query.TableHandler.FieldElementBindings.ToArray();
+                string whereText = query.WhereClause.ParameterizedText;
+
+                // Every WhereClause starts parameter names at @a. Make them unique
+                // before combining the statements into one command.
+                foreach (QueryParameter parameter in query.WhereClause.Parameters.OrderByDescending(parameter => parameter.Name.Length))
+                {
+                    string uniqueName = $"@q{queryIndex}_{parameter.Name.AsSpan(1)}";
+                    whereText = whereText.Replace(parameter.Name, uniqueName, StringComparison.Ordinal);
+                    parameters.Add(new QueryParameter(uniqueName, parameter.Value, parameter.ValueType));
+                }
+
+                if (queryIndex != 0)
+                    commandText.AppendLine(";");
+
+                commandText.Append("SELECT ")
+                    .AppendJoin(", ", columns.Select(column => $"`{column.ColumnName}`"))
+                    .Append(" FROM `")
+                    .Append(query.TableHandler.TableName)
+                    .Append("` ")
+                    .Append(whereText);
+
+                resultShapes.Add((query.TableHandler, columns, columns.FirstOrDefault(column => column.PrimaryKey != null)));
+            }
+
+            List<List<DataObject>> resultSets = new(queries.Count);
+            ExecuteMultiResultSelectImpl(commandText.ToString(), parameters, resultShapes, resultSets);
+            return resultSets;
+        }
+
+        private void ExecuteMultiResultSelectImpl(
+            string commandText,
+            IReadOnlyList<QueryParameter> parameters,
+            IReadOnlyList<(DataTableHandler Handler, ElementBinding[] Columns, ElementBinding Primary)> resultShapes,
+            List<List<DataObject>> resultSets)
+        {
+            if (log.IsDebugEnabled)
+                log.DebugFormat("ExecuteMultiResultSelectImpl: {0}", commandText);
+
+            bool repeat;
+
+            do
+            {
+                repeat = false;
+                resultSets.Clear();
+                DbConnection conn = null;
+
+                try
+                {
+                    conn = CreateConnection(ConnectionString);
+
+                    using DbCommand cmd = conn.CreateCommand();
+                    cmd.CommandText = commandText;
+                    FillSQLParameter(parameters, cmd.Parameters);
+                    OpenConnection(conn);
+                    long start = MonotonicTime.NowMs;
+
+                    using DbDataReader reader = cmd.ExecuteReader();
+
+                    for (int resultIndex = 0; resultIndex < resultShapes.Count; resultIndex++)
+                    {
+                        var shape = resultShapes[resultIndex];
+                        FillQueryResultList(reader, shape.Handler, shape.Columns, shape.Primary, resultSets);
+
+                        if (resultIndex + 1 < resultShapes.Count && !reader.NextResult())
+                            throw new DatabaseException($"Expected {resultShapes.Count} relation result sets but received {resultIndex + 1}.");
+                    }
+
+                    long elapsed = MonotonicTime.NowMs - start;
+
+                    if (log.IsDebugEnabled)
+                        log.DebugFormat("ExecuteMultiResultSelectImpl: SQL select exec time {0}ms for {1} result sets", elapsed, resultShapes.Count);
+                    else if (log.IsWarnEnabled && elapsed > LONG_EXEC_THRESHOLD)
+                        log.WarnFormat("ExecuteMultiResultSelectImpl: SQL select took {0}ms for {1} result sets!", elapsed, resultShapes.Count);
+                }
+                catch (Exception e)
+                {
+                    if (!HandleException(e))
+                    {
+                        if (log.IsErrorEnabled)
+                            log.ErrorFormat("ExecuteMultiResultSelectImpl: Unhandled exception in multi-result select\n{0}", e);
+
+                        throw;
+                    }
+
+                    repeat = true;
+                }
+                finally
+                {
+                    if (conn != null)
+                        CloseConnection(conn);
+                }
+            }
+            while (repeat);
         }
 
         private void FillQueryResultList(IDataReader reader, DataTableHandler tableHandler, ElementBinding[] columns, ElementBinding primary, List<List<DataObject>> resultList)
